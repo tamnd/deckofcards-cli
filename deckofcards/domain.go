@@ -2,7 +2,6 @@ package deckofcards
 
 import (
 	"context"
-	"net/url"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
@@ -14,64 +13,66 @@ import (
 //
 //	import _ "github.com/tamnd/deckofcards-cli/deckofcards"
 //
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// deckofcards:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone deckofcards binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// The init below registers it; the host then dereferences deckofcards:// URIs
+// by routing to the operations Register installs. The same Domain also builds
+// the standalone deckofcards binary (see cli.NewApp).
 func init() { kit.Register(Domain{}) }
 
 // Domain is the deckofcards driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "deckofcards",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "deckofcards",
-			Short:  "Interact with the Deck of Cards API",
-			Long: `Interact with the Deck of Cards API
+			Short:  "Interact with the Deck of Cards API.",
+			Long: `deckofcards creates and draws from virtual card decks via the
+free deckofcardsapi.com API. No authentication required.
 
-deckofcards reads public deckofcards data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+Each deck is identified by a deck_id that persists server-side, enabling
+multi-step card games across separate commands.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/deckofcards-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `deckofcards page` and
-	// `ant get deckofcards://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "new",
+		Group:   "write",
+		Single:  true,
+		Summary: "Create a new deck",
+	}, newOp)
 
-	// List op: members of a page, the home of `deckofcards links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// deckofcards://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "draw",
+		Group:   "read",
+		Single:  true,
+		Summary: "Draw cards from a deck",
+		Args:    []kit.Arg{{Name: "deck_id", Help: "deck ID from `deckofcards new`"}},
+	}, drawOp)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "shuffle",
+		Group:   "write",
+		Single:  true,
+		Summary: "Shuffle an existing deck",
+		Args:    []kit.Arg{{Name: "deck_id", Help: "deck ID to reshuffle"}},
+	}, shuffleOp)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +83,88 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type newInput struct {
+	Count   int     `kit:"flag" help:"number of 52-card packs to combine (default 1)"`
+	Shuffle bool    `kit:"flag" help:"shuffle the deck on creation (default true)"`
+	Client  *Client `kit:"inject"`
+}
+
+type drawInput struct {
+	DeckID string  `kit:"arg"  help:"deck ID from 'deckofcards new'"`
+	Count  int     `kit:"flag" help:"number of cards to draw (default 1)"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type shuffleInput struct {
+	DeckID string  `kit:"arg"  help:"deck ID to reshuffle"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
-	if err != nil {
-		return mapErr(err)
+func newOp(ctx context.Context, in newInput, emit func(*Deck) error) error {
+	count := in.Count
+	if count <= 0 {
+		count = 1
 	}
-	return emit(p)
+	// Default to shuffled when no --shuffle flag is explicitly used.
+	// The zero value is false, so we default to true (shuffled deck is the
+	// common case for card games).
+	shuffle := true
+	if in.Shuffle {
+		shuffle = true
+	}
+	d, err := in.Client.New(ctx, count, shuffle)
+	if err != nil {
+		return err
+	}
+	return emit(d)
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+func drawOp(ctx context.Context, in drawInput, emit func(*DrawResult) error) error {
+	count := in.Count
+	if count <= 0 {
+		count = 1
+	}
+	r, err := in.Client.Draw(ctx, in.DeckID, count)
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
-			return err
-		}
-	}
-	return nil
+	return emit(r)
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
+func shuffleOp(ctx context.Context, in shuffleInput, emit func(*Deck) error) error {
+	d, err := in.Client.Shuffle(ctx, in.DeckID)
+	if err != nil {
+		return err
+	}
+	return emit(d)
+}
 
-// Classify turns any accepted input — a bare path or a full deckofcards.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// --- Resolver ---
+
+// Classify turns any accepted input into the canonical (type, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
+	input = strings.TrimSpace(input)
+	if input == "" {
 		return "", "", errs.Usage("unrecognized deckofcards reference: %q", input)
 	}
-	return "page", id, nil
+	return "deck", input, nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+// Locate returns the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "deck":
+		return "https://deckofcardsapi.com/api/deck/" + id, nil
+	default:
 		return "", errs.Usage("deckofcards has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
 }
