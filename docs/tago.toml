@@ -1,0 +1,10 @@
+title       = "deckofcards"
+baseURL     = "https://deckofcards-cli.tamnd.com/"
+description = "Interact with the Deck of Cards API"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/deckofcards-cli"
